@@ -15,6 +15,10 @@ import GHC (LHsExpr, LPat, DynFlags, SrcSpan, Type, Located, ParsedSource, Renam
 import qualified GHC as G
 import qualified Var as G
 import qualified Type as G
+import TcHsSyn
+import qualified Desugar as G
+import qualified TysWiredIn as G
+import qualified HscTypes as G
 #if __GLASGOW_HASKELL__ < 804
 import GHC.SYB.Utils
 #endif
@@ -34,11 +38,67 @@ import qualified Data.Map as M
 
 ----------------------------------------------------------------
 
+
+
+-- | This instance tries to construct 'HieAST' nodes which include the type of
+-- the expression. It is not yet possible to do this efficiently for all
+-- expression forms, so we skip filling in the type for those inputs.
+--
+-- 'HsApp', for example, doesn't have any type information available directly on
+-- the node. Our next recourse would be to desugar it into a 'CoreExpr' then
+-- query the type of that. Yet both the desugaring call and the type query both
+-- involve recursive calls to the function and argument! This is particularly
+-- problematic when you realize that the HIE traversal will eventually visit
+-- those nodes too and ask for their types again.
+--
+-- Since the above is quite costly, we just skip cases where computing the
+-- expression's type is going to be expensive.
+--
+-- See #16233
 instance HasType (LHsExpr GhcTc) where
-    getType tcm e = do
-        hs_env <- G.getSession
-        mbe <- liftIO $ Gap.deSugar tcm e hs_env
-        return $ (G.getLoc e, ) <$> CoreUtils.exprType <$> mbe
+  getType _ e@(L spn e') =
+    -- Some expression forms have their type immediately available
+    let tyOpt = case e' of
+          G.HsLit _ l -> Just (hsLitType l)
+          G.HsOverLit _ o -> Just (G.overLitType o)
+
+          G.HsLam     _ (G.MG { mg_ext = groupTy }) -> Just (matchGroupType groupTy)
+          G.HsLamCase _ (G.MG { mg_ext = groupTy }) -> Just (matchGroupType groupTy)
+          G.HsCase _  _ (G.MG { mg_ext = groupTy }) -> Just (G.mg_res_ty groupTy)
+
+          G.ExplicitList  ty _ _   -> Just (G.mkListTy ty)
+          G.ExplicitSum   ty _ _ _ -> Just (G.mkSumTy ty)
+          G.HsDo          ty _ _   -> Just ty
+          G.HsMultiIf     ty _     -> Just ty
+
+          _ -> Nothing
+
+    in
+    case tyOpt of
+      _ | skipDesugaring e' -> pure Nothing
+        | otherwise -> do
+            hs_env <- getSession
+            (_,mbe) <- liftIO $ G.deSugarExpr hs_env e
+            pure $ ((spn,) . exprType <$> mbe)
+    where
+      matchGroupType :: G.MatchGroupTc -> Type
+      matchGroupType (G.MatchGroupTc args res) = G.mkFunTys args res
+
+      -- | Skip desugaring of these expressions for performance reasons.
+      --
+      -- See impact on Haddock output (esp. missing type annotations or links)
+      -- before marking more things here as 'False'. See impact on Haddock
+      -- performance before marking more things as 'True'.
+      skipDesugaring :: G.HsExpr a -> Bool
+      skipDesugaring e = case e of
+        G.HsVar{}        -> False
+        G.HsUnboundVar{} -> False
+        G.HsConLikeOut{} -> False
+        G.HsRecFld{}     -> False
+        G.HsOverLabel{}  -> False
+        G.HsIPVar{}      -> False
+        G.HsWrap{}       -> False
+        _              -> True
 
 instance HasType (LPat GhcTc) where
     getType _ (G.L spn pat) = return $ Just (spn, hsPatType pat)
